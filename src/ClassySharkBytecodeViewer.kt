@@ -12,26 +12,33 @@
  * permissions and limitations under the License.
  */
 
-import com.strobel.decompiler.DecompilerDriver
+import ClassySharkBytecodeViewer.ClassRecomplied.CLASS_RECOMPILED
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.util.TraceClassVisitor
 import java.awt.BorderLayout
 import java.awt.Color
 import java.awt.Dimension
 import java.awt.Font
+import java.beans.PropertyChangeEvent
+import java.beans.PropertyChangeListener
 import java.io.*
+import java.util.prefs.Preferences
 import javax.swing.*
 import javax.swing.filechooser.FileNameExtensionFilter
 
-class ClassySharkBytecodeViewer @Throws(Exception::class)
-constructor() : JFrame() {
-
-    internal var javaArea: JTextPane
-    internal var asmArea: JTextPane
-    internal var ASM: String = ""
-    internal val panelTitle = "ClassyShark Byte Code Viewer"
-    internal val RESULT_AREAS_BACKGROUND = Color(46, 48, 50)
-    internal val INPUT_AREA_BACKGROUND = Color(88, 110, 117)
+class ClassySharkBytecodeViewer: JFrame(), PropertyChangeListener {
+    
+    private var loadedFile: File
+    private var loadedFileWatcherThread: FileWatcherThread
+    private val searchText: JTextField
+    private var javaArea: JTextPane
+    private var asmArea: JTextPane
+    private var hexArea: HexPanel
+    private var ASM: String = ""
+    private val panelTitle = "ClassyShark Byte Code Viewer"
+    private val RESULT_AREAS_BACKGROUND = Color(46, 48, 50)
+    private val INPUT_AREA_BACKGROUND = Color(88, 110, 117)
+    private val LAST_USED_FOLDER: String = "ClassySharkBytecodeViewer"
 
     object IntroTextHolder {
         @JvmStatic val INTRO_TEXT = "\n\n\n\n\n\n\n\n\n\n" +
@@ -40,6 +47,10 @@ constructor() : JFrame() {
                 Version.MAJOR + "." + Version.MINOR
     }
 
+    object ClassRecomplied {
+        const val CLASS_RECOMPILED= "ClassRecompiled"
+    }
+    
     init {
         title = panelTitle
         defaultCloseOperation = JFrame.EXIT_ON_CLOSE
@@ -47,10 +58,11 @@ constructor() : JFrame() {
 
         val mainPanel = JPanel()
         mainPanel.layout = BoxLayout(mainPanel, BoxLayout.Y_AXIS)
+        val tabbedPane = JTabbedPane()
 
         val openButton = JButton(createImageIcon("ic_open.png", "Search"))
         openButton.addActionListener { openButtonPressed() }
-        val searchText = JTextField()
+        searchText = JTextField()
         searchText.font = Font("Menlo", Font.PLAIN, 18)
         searchText.background = INPUT_AREA_BACKGROUND
         searchText.foreground = Color.CYAN
@@ -74,7 +86,9 @@ constructor() : JFrame() {
         javaArea.transferHandler = FileTransferHandler(this)
         javaArea.preferredSize = Dimension(830, 250)
         val javaScrollPane = JScrollPane(javaArea)
-        resultPanel.add(javaScrollPane)
+
+        tabbedPane.addTab("Java", null, javaScrollPane,
+                "Java sources")
 
         asmArea = SyntaxPane()
         asmArea.font = Font("Menlo", Font.PLAIN, 18)
@@ -83,24 +97,68 @@ constructor() : JFrame() {
         asmArea.foreground = Color.CYAN
         asmArea.text = SharkBG.SHARKEY
         val asmScrollPane = JScrollPane(asmArea)
-        resultPanel.add(asmScrollPane)
+        tabbedPane.addTab("Bytecode", null, asmScrollPane,
+                "Java Bytecode")
 
+        hexArea = HexPanel(File(""))
+        tabbedPane.addTab("Hex", null, hexArea,"Hex")
+
+        resultPanel.add(tabbedPane)
         mainPanel.add(resultPanel)
 
         val asmSearch = IncrementalSearch(asmArea)
         val javaSearch = IncrementalSearch(javaArea)
+        val asciiSearch = IncrementalSearch(hexArea.asciiView)
+        val hexSearch = IncrementalSearch(hexArea.hexView)
+
         searchText.document.addDocumentListener(asmSearch)
         searchText.addActionListener(asmSearch)
         searchText.document.addDocumentListener(javaSearch)
         searchText.addActionListener(javaSearch)
+        searchText.document.addDocumentListener(asciiSearch)
+        searchText.addActionListener(asciiSearch)
+        searchText.document.addDocumentListener(hexSearch)
+        searchText.addActionListener(hexSearch)
 
         contentPane = mainPanel
         pack()
         setLocationRelativeTo(null)
+
+        loadedFile = File("")
+        loadedFileWatcherThread = FileWatcherThread("", "", this)
+    }
+
+    override fun propertyChange(evt: PropertyChangeEvent) {
+        if (evt.propertyName == CLASS_RECOMPILED) {
+            // Received new command (outside EDT)
+            SwingUtilities.invokeLater {
+                // Updating GUI inside EDT
+                onFileRecompiled()
+            }
+        }
+    }
+
+    fun onFileLoaded(externalFile: File) = try {
+        this.loadedFile = externalFile
+        title = panelTitle + " - " + externalFile.name
+
+        fillJavaArea(externalFile)
+        fillAsmArea(externalFile)
+        hexArea.fillFromFile(externalFile)
+
+        watchLoadedFileChanges(externalFile)
+    } catch (e: FileNotFoundException) {
+        e.printStackTrace()
+    } catch (e: IOException) {
+        e.printStackTrace()
     }
 
     private fun openButtonPressed() {
-        val fc = JFileChooser("ClassyShark Bytecode Viewer")
+
+        val prefs = Preferences.userRoot().node(LAST_USED_FOLDER)
+
+        val fc = JFileChooser(prefs.get(LAST_USED_FOLDER,
+                 File(".").absolutePath))
         fc.fileSelectionMode = JFileChooser.FILES_AND_DIRECTORIES
 
         val filter = FileNameExtensionFilter("classes", "class")
@@ -109,15 +167,19 @@ constructor() : JFrame() {
 
         val retValue = fc.showOpenDialog(JPanel())
         if (retValue == JFileChooser.APPROVE_OPTION) {
-            onFileDragged(fc.selectedFile)
+            onFileLoaded(fc.selectedFile)
+            prefs.put(LAST_USED_FOLDER, fc.selectedFile.parent)
         }
     }
 
-    fun onFileDragged(file: File) {
+    private fun onFileRecompiled() {
         try {
-            title = panelTitle + " - " + file.name
-            fillJavaArea(file)
-            fillAsmArea(file)
+            title = panelTitle + " - " + loadedFile.name
+            searchText.text = ""
+
+            fillJavaArea(loadedFile)
+            fillAsmArea(loadedFile)
+            hexArea.fillFromFile(loadedFile)
         } catch (e: FileNotFoundException) {
             e.printStackTrace()
         } catch (e: IOException) {
@@ -125,7 +187,25 @@ constructor() : JFrame() {
         }
     }
 
+    private fun watchLoadedFileChanges(file: File) {
+
+        if(loadedFileWatcherThread.isAlive) {
+            loadedFileWatcherThread.interrupt()
+        }
+
+        loadedFileWatcherThread = FileWatcherThread(file.parent, file.name, this)
+        loadedFileWatcherThread.start()
+
+        // the line below must be there otherwise threading + file system events
+        // don't work possibly after the thread had started
+        loadedFileWatcherThread.addPropertyChangeListener(this)
+    }
+
     private fun fillAsmArea(file: File) {
+        if(!file.exists()) {
+            return
+        }
+
         javaArea.caretPosition = 0
         val inputStream = FileInputStream(file)
         val reader = ClassReader(inputStream)
@@ -138,31 +218,33 @@ constructor() : JFrame() {
     }
 
     private fun fillJavaArea(file: File) {
-        // // Start capturing
-        val buffer = ByteArrayOutputStream()
-        System.setOut(PrintStream(buffer))
+        if(!file.exists()) {
+            return
+        }
 
-        // Run what is supposed to output something
-        DecompilerDriver.main(arrayOf(file.absolutePath))
+        val writer = StringWriter()
 
-        // Stop capturing
-        System.setOut(PrintStream(FileOutputStream(FileDescriptor.out)))
+        try {
+            com.strobel.decompiler.Decompiler.decompile(
+                    file.absolutePath,
+                    com.strobel.decompiler.PlainTextOutput(writer)
+            )
+        } finally {
+            writer.flush()
+        }
 
-        // Use captured content
-        val content = buffer.toString()
-        buffer.reset()
-
+        val content = writer.toString()
         javaArea.text = content
     }
 
     private fun createImageIcon(path: String,
                                 description: String): ImageIcon? {
         val imgURL = javaClass.getResource(path)
-        if (imgURL != null) {
-            return ImageIcon(imgURL, description)
+        return if (imgURL != null) {
+            ImageIcon(imgURL, description)
         } else {
             System.err.println("Couldn't find file: " + path)
-            return null
+            null
         }
     }
 
@@ -173,7 +255,7 @@ constructor() : JFrame() {
                     val bytecodeViewer = ClassySharkBytecodeViewer()
 
                     if (args.size == 1) {
-                        bytecodeViewer.onFileDragged(File(args[0]))
+                        bytecodeViewer.onFileLoaded(File(args[0]))
                     } else if (args.size > 1) {
                         System.out.println("Usage: java -jar ClassySharkBytecodeViewer.jar <path to .class file>")
                     }
